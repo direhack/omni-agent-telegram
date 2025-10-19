@@ -1,166 +1,94 @@
-// index.js — Real Alerts: Contract Creation + Pancake v2 pair within 30m
-import { Telegraf } from 'telegraf';
-import fetch from 'node-fetch';
-
-const BOT_TOKEN  = process.env.BOT_TOKEN;
-const CHAT_ID    = process.env.CHAT_ID;
-
-const BSCSCAN_API = process.env.BSCSCAN_API; // https://bscscan.com/myapikey
-const DEPLOYER    = (process.env.DEPLOYER || '').toLowerCase();
-const POLL_MS     = Number(process.env.POLL_MS || 60000);
-
-const DEX_MIN_LP_USD       = Number(process.env.DEX_MIN_LP || 50000);
-const DEXCHECK_WINDOW_MIN  = Number(process.env.DEXCHECK_WINDOW_MIN || 30);
-const DEXCHECK_INTERVAL_MS = Number(process.env.DEXCHECK_INTERVAL_MS || 30000);
-
-if (!BOT_TOKEN || !CHAT_ID || !BSCSCAN_API || !DEPLOYER) {
-  console.error('Missing required ENV: BOT_TOKEN, CHAT_ID, BSCSCAN_API, DEPLOYER');
-  process.exit(1);
-}
-
-const bot = new Telegraf(BOT_TOKEN);
-
-// ---- helpers ----
-async function tgSend(text) {
-  try {
-    await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: 'Markdown' });
-  } catch (e) {
-    console.error('tgSend error', e);
-  }
-}
-
-const seenTx = new Set();  // дедуп по txhash (в памяти)
-let lastBlockChecked = 0;  // чтобы не пропускать между перезапусками можно вынести в KV/Redis
-
-function short(addr) { return addr ? addr.slice(0,6) + '…' + addr.slice(-4) : ''; }
-
-// BscScan: получить последние транзакции деплойера
-async function fetchDeployerTxs() {
-  // account.txlist вернёт обычные внешние tx
-  const url = `https://api.bscscan.com/api?module=account&action=txlist&address=${DEPLOYER}`
-            + `&startblock=0&endblock=99999999&sort=desc&apikey=${BSCSCAN_API}`;
-  const r = await fetch(url); const j = await r.json();
-  if (j.status !== '1') return [];
-  return j.result; // массив tx
-}
-
-// Для каждой tx получим адрес созданного контракта (если это Contract Creation)
-async function getCreatedContract(txhash) {
-  // eth_getTransactionReceipt содержит contractAddress
-  const url = `https://api.bscscan.com/api?module=proxy&action=eth_getTransactionReceipt&txhash=${txhash}&apikey=${BSCSCAN_API}`;
-  const r = await fetch(url); const j = await r.json();
-  const receipt = j.result || {};
-  return receipt.contractAddress && receipt.contractAddress !== '0x0000000000000000000000000000000000000000'
-    ? receipt.contractAddress
-    : null;
-}
-
-async function dexFindPairs(tokenAddr) {
-  const url = `https://api.dexscreener.com/latest/dex/tokens/${tokenAddr}`;
-  const r = await fetch(url);
-  if (!r.ok) return [];
-  const j = await r.json();
-  return Array.isArray(j.pairs) ? j.pairs : [];
-}
-
-function formatPairLine(p) {
-  const liq = p.liquidity?.usd ?? 0;
-  const dex = p.dexId || 'dex';
-  const quote = p.quoteToken?.symbol || p.quoteToken?.address || '?';
-  const link = p.url || (p.pairAddress ? `https://dexscreener.com/bsc/${p.pairAddress}` : '');
-  return `• ${dex} ${p.baseToken?.symbol || ''}/${quote} — LP ~$${Math.round(liq).toLocaleString()} ${link ? `\n${link}`:''}`;
-}
-
-// Планировщик проверки пары 30 мин после деплоя
-function scheduleDexWatch(createdAddr, createdAtUtc) {
-  const started = Date.now();
-  const until = started + DEXCHECK_WINDOW_MIN * 60_000;
-
-  const timer = setInterval(async () => {
-    if (Date.now() > until) return clearInterval(timer);
-
-    try {
-      const pairs = await dexFindPairs(createdAddr);
-      if (!pairs.length) return;
-
-      // Ищем Pancake v2 + quote WBNB (если есть) и LP >= threshold
-      const good = pairs.filter(p => 
-        (p.dexId || '').toLowerCase().includes('pancake') &&
-        (p.quoteToken?.symbol === 'WBNB' || (p.quoteToken?.address || '').toLowerCase() === '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c') &&
-        (p.liquidity?.usd || 0) >= DEX_MIN_LP_USD
-      );
-
-      if (good.length) {
-        const lines = good.map(formatPairLine).join('\n');
-        await tgSend(
-          `🚨 *Pair detected within ${DEXCHECK_WINDOW_MIN}m*\n`
-          + `Token: \`${createdAddr}\`\n`
-          + `Created @ ${createdAtUtc} UTC\n`
-          + `Threshold: $${DEX_MIN_LP_USD}\n`
-          + `${lines}`
-        );
-        clearInterval(timer);
-      }
-    } catch (e) {
-      // глушим, просто попробуем в следующем тике
-    }
-  }, DEXCHECK_INTERVAL_MS);
-}
-
-// Основной цикл: ловим новые Contract Creation
-async function tick() {
-  try {
-    const txs = await fetchDeployerTxs();
-    for (const tx of txs) {
-      const isNewerBlock = Number(tx.blockNumber) > lastBlockChecked;
-      const isCreation = (tx.to === '' || tx.to === null); // у creation поле 'to' пустое
-      const fresh = (Date.now()/1000 - Number(tx.timeStamp)) < (60*60*6); // ограничим последние 6ч
-
-      if (!isNewerBlock && seenTx.has(tx.hash)) continue;
-      if (!isCreation || !fresh) continue;
-
-      // узнаём адрес созданного контракта
-      const contractAddr = await getCreatedContract(tx.hash);
-      if (!contractAddr) continue;
-
-      seenTx.add(tx.hash);
-      lastBlockChecked = Math.max(lastBlockChecked, Number(tx.blockNumber));
-
-      const createdAtUtc = new Date(Number(tx.timeStamp)*1000).toISOString().replace('T',' ').replace('.000Z','');
-
-      await tgSend(
-        `🆕 *Contract Creation detected*\n`
-        + `Deployer: \`${DEPLOYER}\`\n`
-        + `Tx: \`${tx.hash}\`\n`
-        + `Created: \`${contractAddr}\`\n`
-        + `Block: ${tx.blockNumber}\n`
-        + `Time (UTC): ${createdAtUtc}`
-      );
-
-      // Сразу запускаем слежение за появлением пары
-      scheduleDexWatch(contractAddr, createdAtUtc);
-    }
-  } catch (e) {
-    console.error('tick error', e);
-  } finally {
-    setTimeout(tick, POLL_MS);
-  }
-}
-
-// boot
-bot.launch().then(() => {
-  tgSend('🤖 Omni Agent live. Monitoring deployer: `' + DEPLOYER + '`');
-  tick();
-});
-
-// graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-// --- keep Render happy ---
 import express from "express";
+import fetch from "node-fetch";
+
 const app = express();
-app.get("/", (req, res) => res.send("Omni Agent running"));
-app.listen(process.env.PORT || 10000, () => {
-  console.log(`Server ready on port ${process.env.PORT || 10000}`);
+const port = process.env.PORT || 10000;
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const CHAT_ID = process.env.CHAT_ID;
+const BSCSCAN_API = process.env.BSCSCAN_API;
+const DEPLOYER = (process.env.DEPLOYER || "").toLowerCase();
+const INTERVAL_MINUTES = parseInt(process.env.INTERVAL_MINUTES || "2", 10);
+
+let lastRun = null;
+let lastCheckedBlock = 0;
+let lastHash = null;
+
+async function send(msg) {
+  try {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${encodeURIComponent(msg)}`);
+  } catch (e) {
+    console.error("Telegram send error:", e);
+  }
+}
+
+async function checkNewContracts() {
+  console.log("Polling BSC…", new Date().toISOString());
+  lastRun = new Date().toISOString();
+
+  if (!BSCSCAN_API || !DEPLOYER) {
+    console.warn("Missing BSCSCAN_API or DEPLOYER");
+    return;
+  }
+
+  const url = `https://api.bscscan.com/api?module=account&action=txlist&address=${DEPLOYER}&startblock=${lastCheckedBlock}&endblock=99999999&sort=desc&apikey=${BSCSCAN_API}`;
+  const res = await fetch(url);
+  const data = await res.json();
+
+  if (!data || data.status !== "1" || !Array.isArray(data.result)) {
+    console.log("BscScan: empty / rate limited / error");
+    return;
+  }
+
+  const created = data.result.filter(tx => tx.contractAddress && tx.isError === "0");
+  if (!created.length) {
+    console.log("No new contracts yet.");
+    return;
+  }
+
+  created.sort((a, b) => Number(b.blockNumber) - Number(a.blockNumber));
+  const newest = created[0];
+  const txHash = newest.hash;
+  const createdAddr = newest.contractAddress;
+  const timeUTC = new Date(Number(newest.timeStamp) * 1000).toISOString();
+
+  lastCheckedBlock = Number(newest.blockNumber);
+  lastHash = txHash;
+
+  console.log("Found new contract:", createdAddr, "at", timeUTC);
+  await send(`🆕 New Contract Creation:
+tx: ${txHash}
+time: ${timeUTC}
+address: ${createdAddr}`);
+
+  try {
+    const ds = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${createdAddr}`);
+    const dj = await ds.json();
+    if (dj && Array.isArray(dj.pairs) && dj.pairs.length) {
+      const pair = dj.pairs.find(p => p.chainId === "bsc" && /pancake/i.test(p.dexId) && /WBNB/i.test(p.quoteToken?.symbol || ""));
+      if (pair) {
+        await send(`🔗 Pair detected: ${pair.pairAddress}
+Liquidity: $${pair.liquidity?.usd || "?"}
+Dexscreener: https://dexscreener.com/bsc/${pair.pairAddress}`);
+      } else {
+        await send("ℹ️ Pair not yet found for " + createdAddr);
+      }
+    }
+  } catch (e) {
+    console.error("Dexscreener error:", e);
+  }
+}
+
+// Web endpoints
+app.get("/", (req, res) => res.send("Omni Agent is running"));
+app.get("/status", (req, res) => res.json({ lastRun, lastHash, lastCheckedBlock, interval: INTERVAL_MINUTES }));
+app.get("/force", async (req, res) => {
+  await checkNewContracts();
+  res.send("Manual check complete");
 });
+
+app.listen(port, () => console.log(`Server ready on port ${port}`));
+
+// 🔁 Автозапуск цикла
+setInterval(checkNewContracts, INTERVAL_MINUTES * 60 * 1000);
+checkNewContracts();
