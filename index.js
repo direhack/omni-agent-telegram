@@ -156,3 +156,11 @@ bot.launch().then(() => {
 // graceful stop
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+// --- keep Render happy ---
+import express from "express";
+const app = express();
+app.get("/", (req, res) => res.send("Omni Agent running"));
+app.listen(process.env.PORT || 10000, () => {
+  console.log(`Server ready on port ${process.env.PORT || 10000}`);
+});
